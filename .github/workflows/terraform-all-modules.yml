@@ -1,0 +1,162 @@
+name: All Modules Validation
+
+on:
+  push:
+    branches: [ main, develop, feature/* ]
+    paths:
+      - 'modules/**'
+      - '.github/workflows/terraform-all-modules.yml'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'modules/**'
+      - '.github/workflows/terraform-all-modules.yml'
+
+jobs:
+  discover-modules:
+    name: Discover Terraform Modules
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v5
+    
+    - name: Set matrix
+      id: set-matrix
+      run: |
+        modules=$(find modules -name "*.tf" -exec dirname {} \; | sort -u | jq -R -s -c 'split("\n")[:-1]')
+        echo "matrix=$modules" >> $GITHUB_OUTPUT
+
+  validate-modules:
+    name: Validate Module
+    runs-on: ubuntu-latest
+    needs: discover-modules
+    if: ${{ needs.discover-modules.outputs.matrix != '[]' && needs.discover-modules.outputs.matrix != '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ${{ fromJson(needs.discover-modules.outputs.matrix) }}
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v5
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ~1.12.1
+
+    - name: Get module name
+      id: module-info
+      run: |
+        MODULE_NAME=$(basename ${{ matrix.module }})
+        echo "name=$MODULE_NAME" >> $GITHUB_OUTPUT
+
+    - name: Terraform Format Check
+      id: fmt
+      run: terraform fmt -check -recursive
+      working-directory: ${{ matrix.module }}
+      continue-on-error: true
+
+    - name: Terraform Init
+      id: init
+      run: terraform init -backend=false
+      working-directory: ${{ matrix.module }}
+
+    - name: Terraform Validate
+      id: validate
+      run: terraform validate
+      working-directory: ${{ matrix.module }}
+
+    - name: Check if example exists
+      id: check-example
+      run: |
+        if [ -d "${{ matrix.module }}/examples/basic" ]; then
+          echo "exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "exists=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Terraform Plan (Example)
+      id: plan
+      if: steps.check-example.outputs.exists == 'true'
+      run: |
+        cd examples/basic
+        terraform init -backend=false
+        terraform plan
+      working-directory: ${{ matrix.module }}
+      continue-on-error: true
+
+    - name: Comment PR
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const moduleName = '${{ steps.module-info.outputs.name }}';
+          const exampleExists = '${{ steps.check-example.outputs.exists }}';
+          
+          let output = `### ${moduleName.toUpperCase()} Module Terraform Validation Results
+
+          #### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+          #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+          #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\``;
+
+          if (exampleExists === 'true') {
+            output += `
+          #### Terraform Plan (Example) 📖\`${{ steps.plan.outcome }}\`
+
+          <details><summary>Show Plan Output</summary>
+
+          \`\`\`terraform
+          ${{ steps.plan.outputs.stdout }}
+          \`\`\`
+
+          </details>`;
+          } else {
+            output += `
+          #### Example Directory 📁 Not Found`;
+          }
+
+          output += `
+
+          *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Workflow: \`${{ github.workflow }}\`*`;
+
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: output
+          })
+
+    - name: Fail on Format Issues
+      if: steps.fmt.outcome == 'failure'
+      run: |
+        echo "❌ Terraform format check failed for ${{ steps.module-info.outputs.name }} module"
+        exit 1
+
+    - name: Fail on Validation Issues
+      if: steps.validate.outcome == 'failure'
+      run: |
+        echo "❌ Terraform validation failed for ${{ steps.module-info.outputs.name }} module"
+        exit 1
+
+  summary:
+    name: Validation Summary
+    runs-on: ubuntu-latest
+    needs: [discover-modules, validate-modules]
+    if: always()
+    steps:
+    - name: Summary
+      run: |
+        echo "🏁 Terraform modules validation complete"
+        echo "📊 Modules discovered: ${{ needs.discover-modules.outputs.matrix }}"
+        
+        if [[ "${{ needs.validate-modules.result }}" == "success" ]]; then
+          echo "✅ All modules validation passed"
+        elif [[ "${{ needs.validate-modules.result }}" == "failure" ]]; then
+          echo "❌ Some modules validation failed"
+          exit 1
+        else
+          echo "⚠️ Modules validation was skipped or cancelled"
+        fi
